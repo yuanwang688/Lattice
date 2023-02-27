@@ -125,11 +125,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
 
         with torch.no_grad():
-            if self.use_amp:
-                with autocast():
-                    outputs = model(**inputs)
-            else:
-                outputs = model(**inputs)
+            outputs = model(**inputs)
             if has_labels:
                 if self.label_smoother is not None:
                     loss = self.label_smoother(outputs, inputs["labels"]).mean().detach()

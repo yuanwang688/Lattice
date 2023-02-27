@@ -46,6 +46,7 @@ from transformers.models.t5.configuration_t5 import T5Config
 
 from model.structural_attention import rewrite_encoder_attention_mask
 from model.invariant_position import compute_invariant_position
+from model.positional_bucket import compute_positional_bucket
 
 logger = logging.get_logger(__name__)
 
@@ -343,7 +344,7 @@ class T5Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     @staticmethod
-    def _relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128):
+    def _relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128, num_reserved_buckets=0):
         """
         Adapted from Mesh Tensorflow:
         https://github.com/tensorflow/mesh/blob/0cb87fe07da627bf0b7e60475d59f95ed6b5be3d/mesh_tensorflow/transformer/transformer_layers.py#L593
@@ -384,7 +385,7 @@ class T5Attention(nn.Module):
             * (num_buckets - max_exact)
         ).to(torch.long)
         relative_postion_if_large = torch.min(
-            relative_postion_if_large, torch.full_like(relative_postion_if_large, num_buckets - 1)
+            relative_postion_if_large, torch.full_like(relative_postion_if_large, num_buckets - num_reserved_buckets - 1)
         )
 
         relative_buckets += torch.where(is_small, relative_position, relative_postion_if_large)
@@ -417,6 +418,29 @@ class T5Attention(nn.Module):
         values = self.relative_attention_bias(relative_position_bucket)
         values = values.permute([0, 3, 1, 2])  # shape (batch_size, num_heads, query_length, key_length)
         return values
+
+    def compute_positional_bias(self, query_length, key_length, type_ids, row_ids, col_ids):
+        # number of buckets reserved for positional buckets
+        NUM_RESERVED_BUCKETS=5
+
+        relative_position = compute_invariant_position(query_length, key_length, type_ids, row_ids, col_ids)
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position,  # shape (batch_size, query_length, key_length)
+            bidirectional=(not self.is_decoder),
+            num_buckets=self.relative_attention_num_buckets,
+            num_reserved_buckets=NUM_RESERVED_BUCKETS
+        )
+        positional_bucket = compute_positional_bucket(
+            query_length, key_length, type_ids, row_ids, col_ids, self.relative_attention_num_buckets)
+
+        relative_position_bucket = torch.where(positional_bucket>0, positional_bucket, relative_positon_bucket)
+
+        relative_position_bucket = relative_position_bucket.to(self.relative_attention_bias.weight.device)
+        # shape of values (batch_size, query_length, key_length, num_heads)
+        values = self.relative_attention_bias(relative_position_bucket)
+        values = values.permute([0, 3, 1, 2])  # shape (batch_size, num_heads, query_length, key_length)
+        return values
+
 
     def forward(
         self,
@@ -505,7 +529,8 @@ class T5Attention(nn.Module):
                 )
             else:
                 if type_ids is not None:
-                    position_bias = self.compute_invariant_bias(real_seq_length, key_length, type_ids, row_ids, col_ids)
+                    position_bias = self.compute_positional_bias(real_seq_length, key_length, type_ids, row_ids, col_ids)
+                    # position_bias = self.compute_invariant_bias(real_seq_length, key_length, type_ids, row_ids, col_ids)
                 else:
                     position_bias = self.compute_bias(real_seq_length, key_length)
 

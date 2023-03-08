@@ -317,6 +317,9 @@ class T5Attention(nn.Module):
         self.dropout = config.dropout_rate
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
+        self.use_additional_positional_info = config.use_additional_positional_info
+        self.use_full_relative_position_embedding = config.use_full_relative_position_embedding
+
         # Mesh TensorFlow initialization to avoid scaling before softmax
         self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
         self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
@@ -325,6 +328,11 @@ class T5Attention(nn.Module):
 
         if self.has_relative_attention_bias:
             self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
+
+        if self.use_full_relative_position_embedding:
+            self.relative_position_key_embedding = nn.Embedding(self.relative_attention_num_buckets, config.d_kv)
+            self.relative_position_val_embedding = nn.Embedding(self.relative_attention_num_buckets, config.d_kv)
+
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
@@ -419,7 +427,7 @@ class T5Attention(nn.Module):
         values = values.permute([0, 3, 1, 2])  # shape (batch_size, num_heads, query_length, key_length)
         return values
 
-    def compute_positional_bias(self, query_length, key_length, type_ids, row_ids, col_ids):
+    def compute_additional_positional_info(self, query_length, key_length, type_ids, row_ids, col_ids):
         # number of buckets reserved for positional buckets
         NUM_RESERVED_BUCKETS=5
 
@@ -433,13 +441,35 @@ class T5Attention(nn.Module):
         positional_bucket = compute_positional_bucket(
             query_length, key_length, type_ids, row_ids, col_ids, self.relative_attention_num_buckets)
 
-        relative_position_bucket = torch.where(positional_bucket>0, positional_bucket, relative_positon_bucket)
+        relative_position_bucket = torch.where(positional_bucket>0, positional_bucket, relative_position_bucket)
 
         relative_position_bucket = relative_position_bucket.to(self.relative_attention_bias.weight.device)
+
+        return relative_position_bucket
+
+    def compute_invariant_bias_with_additional_positional_info(
+        self, query_length, key_length, type_ids, row_ids, col_ids):
+
+        relative_position_bucket = self.compute_additional_positional_info(
+            query_length, key_length, type_ids, row_ids, col_ids)
         # shape of values (batch_size, query_length, key_length, num_heads)
         values = self.relative_attention_bias(relative_position_bucket)
         values = values.permute([0, 3, 1, 2])  # shape (batch_size, num_heads, query_length, key_length)
         return values
+
+    def compute_invariant_embeddings_with_additional_positional_info(self, query_length, key_length, type_ids, row_ids, col_ids):
+        relative_position_bucket = self.compute_additional_positional_info(
+            query_length, key_length, type_ids, row_ids, col_ids)
+        # shape of values (batch_size, query_length, key_length, kv_dim)
+        relative_position_key_embedding = self.relative_position_key_embedding(relative_position_bucket)
+        relative_position_val_embedding = self.relative_position_val_embedding(relative_position_bucket)
+
+        # shape of values (batch_size, 1, query_length, key_length, kv_dim)
+        relative_position_key_embedding = relative_position_key_embedding.unsqueeze(1)
+        relative_position_val_embedding = relative_position_val_embedding.unsqueeze(1)
+
+        # shape of values (2, batch_size, 1, query_length, key_length, kv_dim)
+        return torch.stack((relative_position_key_embedding, relative_position_val_embedding))
 
 
     def forward(
@@ -522,53 +552,338 @@ class T5Attention(nn.Module):
             query_states, key_states.transpose(3, 2)
         )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
 
-        if position_bias is None:
-            if not self.has_relative_attention_bias:
-                position_bias = torch.zeros(
-                    (1, self.n_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
-                )
-            else:
-                if type_ids is not None:
-                    position_bias = self.compute_positional_bias(real_seq_length, key_length, type_ids, row_ids, col_ids)
-                    # position_bias = self.compute_invariant_bias(real_seq_length, key_length, type_ids, row_ids, col_ids)
+        if not(self.use_full_relative_position_embedding) or type_ids is not None:
+            if position_bias is None:
+                if not self.has_relative_attention_bias:
+                    position_bias = torch.zeros(
+                        (1, self.n_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
+                    )
                 else:
-                    position_bias = self.compute_bias(real_seq_length, key_length)
+                    if type_ids is not None:
+                        if self.use_additional_positional_info:
+                            position_bias = self.compute_invariant_bias_with_additional_positional_info(real_seq_length, key_length, type_ids, row_ids, col_ids)
+                        else:
+                            position_bias = self.compute_invariant_bias(real_seq_length, key_length, type_ids, row_ids, col_ids)
+                    else:
+                        position_bias = self.compute_bias(real_seq_length, key_length)
 
-            # if key and values are already calculated
-            # we want only the last query position bias
-            if past_key_value is not None:
-                position_bias = position_bias[:, :, -seq_length:, :]
+                # if key and values are already calculated
+                # we want only the last query position bias
+                if past_key_value is not None:
+                    position_bias = position_bias[:, :, -seq_length:, :]
+
+                if mask is not None:
+                    position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
+
+            scores += position_bias
+            attn_weights = F.softmax(scores.float(), dim=-1).type_as(
+                scores
+            )  # (batch_size, n_heads, seq_length, key_length)
+            attn_weights = F.dropout(
+                attn_weights, p=self.dropout, training=self.training
+            )  # (batch_size, n_heads, seq_length, key_length)
+
+            # Mask heads if we want to
+            if layer_head_mask is not None:
+                attn_weights = attn_weights * layer_head_mask
+
+            attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
+            attn_output = self.o(attn_output)
+
+            present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
+            outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
+
+            if output_attentions:
+                outputs = outputs + (attn_weights,)
+            return outputs
+        else:
+            position_embedding = position_bias
+            if position_embedding is None:
+                if not self.has_relative_attention_bias:
+                    position_embedding = torch.zeros(
+                        (2, 1, 1, real_seq_length, key_length, self.key_value_proj_dim), 
+                        device=scores.device, dtype=scores.dtype)
+                else:
+                    position_embedding = self.compute_invariant_embeddings_with_additional_positional_info(
+                        real_seq_length, key_length, type_ids, row_ids, col_ids)
+
+                if past_key_value is not None:
+                    positional_embedding = position_embedding[:, :, :, -seq_length:, :, :]
+
+            # shape (batch_size, 1, query_length, key_length, kv_dim)
+            relative_position_key_embedding = position_embedding[0]
+            relative_position_val_embedding = position_embedding[1]
+
+            score = torch.matmul(query_states, 
+                key_states.transpose(3, 2))
+
+            results = []
+            # shape (batch_size, 1, query_length, kv_dim, key_length)
+            relative_position_key_embedding = relative_position_key_embedding.transpose(4,3)
+            for i in range(relative_position_key_embedding.shape[2]):
+                results.append(
+                    # shape (batch, n_heads, key_length)
+                    torch.matmul(
+                        # shape (batch, n_heads, kv_dim)
+                        query_states[:,:,i,:],
+                        # shape (batch_size, 1, kv_dim, key_length)
+                        relative_position_key_embedding[:,:,i,:,:]
+                        )
+                    )
+
+            relative_position_bias = torch.cat(results, dim=2)
+
+            score += relative_position_bias
 
             if mask is not None:
-                position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
+                score += mask
 
-        scores += position_bias
-        attn_weights = F.softmax(scores.float(), dim=-1).type_as(
-            scores
-        )  # (batch_size, n_heads, seq_length, key_length)
-        attn_weights = F.dropout(
-            attn_weights, p=self.dropout, training=self.training
-        )  # (batch_size, n_heads, seq_length, key_length)
+            attn_weights = F.softmax(scores.float(), dim=-1).type_as(
+                scores
+            )  # (batch_size, n_heads, seq_length, key_length)
+            attn_weights = F.dropout(
+                attn_weights, p=self.dropout, training=self.training
+            )  # (batch_size, n_heads, seq_length, key_length)
 
-        # Mask heads if we want to
-        if layer_head_mask is not None:
-            attn_weights = attn_weights * layer_head_mask
+            # Mask heads if we want to
+            if layer_head_mask is not None:
+                attn_weights = attn_weights * layer_head_mask
 
-        attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
-        attn_output = self.o(attn_output)
+            # (batch_size, seq_length, dim)
+            attn_output = unshape(torch.matmul(attn_weights, value_states))  
+            attn_output = self.o(attn_output)
 
-        present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
-        outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
+            present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
+            outputs = (attn_output,) + (present_key_value_state,) + (position_embedding,)
 
-        if output_attentions:
-            outputs = outputs + (attn_weights,)
-        return outputs
+            if output_attentions:
+                outputs = outputs + (attn_weights,)
+
+            return outputs
+
+
+class T5AttentionFullRelativePositionEmbedding(T5Attention):
+    def __init__(self, config: T5Config, has_relative_attention_bias=False):
+        super().__init__(config, has_relative_attention_bias)
+        if self.has_relative_attention_bias:
+            self.relative_position_key_embedding = nn.Embedding(self.relative_attention_num_buckets, config.d_kv)
+            self.relative_position_val_embedding = nn.Embedding(self.relative_attention_num_buckets, config.d_kv)
+
+    
+    def compute_invariant_embeddings_with_additional_positional_info(self, query_length, key_length, type_ids, row_ids, col_ids):
+        relative_position_bucket = self.compute_additional_positional_info(
+            query_length, key_length, type_ids, row_ids, col_ids)
+        # shape of values (batch_size, query_length, key_length, kv_dim)
+        relative_position_key_embedding = self.relative_position_key_embedding(relative_position_bucket)
+        relative_position_val_embedding = self.relative_position_val_embedding(relative_position_bucket)
+
+        # shape of values (batch_size, 1, query_length, key_length, kv_dim)
+        relative_position_key_embedding = relative_position_key_embedding.unsqueeze(1)
+        relative_position_val_embedding = relative_position_val_embedding.unsqueeze(1)
+
+        # shape of values (2, batch_size, 1, query_length, key_length, kv_dim)
+        return torch.stack((relative_position_key_embedding, relative_position_val_embedding))
+
+    def forward(
+        self,
+        hidden_states,
+        mask=None,
+        key_value_states=None,
+        position_bias=None,
+        past_key_value=None,
+        layer_head_mask=None,
+        query_length=None,
+        use_cache=False,
+        output_attentions=False,
+        type_ids=None,
+        row_ids=None,
+        col_ids=None,
+    ):
+        """
+        Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
+        """
+        # Input is (batch_size, seq_length, dim)
+        # Mask is (batch_size, key_length) (non-causal) or (batch_size, key_length, key_length)
+        # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        real_seq_length = seq_length
+
+        if past_key_value is not None:
+            assert (
+                len(past_key_value) == 2
+            ), "past_key_value should have 2 past states: keys and values. Got {} past states".format(
+                len(past_key_value)
+            )
+            real_seq_length += past_key_value[0].shape[2] if query_length is None else query_length
+
+        key_length = real_seq_length if key_value_states is None else key_value_states.shape[1]
+
+        def shape(states):
+            """  projection """
+            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+
+        def unshape(states):
+            """  reshape """
+            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
+
+        def project(hidden_states, proj_layer, key_value_states, past_key_value):
+            """ projects hidden states correctly to key/query states """
+            if key_value_states is None:
+                # self-attn
+                # (batch_size, n_heads, seq_length, dim_per_head)
+                hidden_states = shape(proj_layer(hidden_states))
+            elif past_key_value is None:
+                # cross-attn
+                # (batch_size, n_heads, seq_length, dim_per_head)
+                hidden_states = shape(proj_layer(key_value_states))
+
+            if past_key_value is not None:
+                if key_value_states is None:
+                    # self-attn
+                    # (batch_size, n_heads, key_length, dim_per_head)
+                    hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
+                else:
+                    # cross-attn
+                    hidden_states = past_key_value
+            return hidden_states
+
+        # get query states
+        query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
+
+        # get key/value states
+        key_states = project(
+            hidden_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
+        )
+        value_states = project(
+            hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
+        )
+
+        # if the input is not a table, then we will use the T5's simplified relative position bias in the attention
+        # output calculation.
+        if type_ids is None:
+            # compute scores
+            scores = torch.matmul(
+                query_states, key_states.transpose(3, 2)
+            )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
+
+            if position_bias is None:
+                if not self.has_relative_attention_bias:
+                    position_bias = torch.zeros(
+                        (1, self.n_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
+                    )
+                else:
+                    # if type_ids is not None:
+                    #     # position_bias = self.compute_invariant_bias_with_additional_positional_info(real_seq_length, key_length, type_ids, row_ids, col_ids)
+                    #     position_bias = self.compute_invariant_bias(real_seq_length, key_length, type_ids, row_ids, col_ids)
+                    # else:
+                    position_bias = self.compute_bias(real_seq_length, key_length)
+
+                # if key and values are already calculated
+                # we want only the last query position bias
+                if past_key_value is not None:
+                    position_bias = position_bias[:, :, -seq_length:, :]
+
+                if mask is not None:
+                    position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
+
+            scores += position_bias
+            attn_weights = F.softmax(scores.float(), dim=-1).type_as(
+                scores
+            )  # (batch_size, n_heads, seq_length, key_length)
+            attn_weights = F.dropout(
+                attn_weights, p=self.dropout, training=self.training
+            )  # (batch_size, n_heads, seq_length, key_length)
+
+            # Mask heads if we want to
+            if layer_head_mask is not None:
+                attn_weights = attn_weights * layer_head_mask
+
+            attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
+            attn_output = self.o(attn_output)
+
+            present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
+            outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
+
+            if output_attentions:
+                outputs = outputs + (attn_weights,)
+
+            return outputs
+
+        # if the input is a table, then we will use the encode additional positional information and also the 
+        # full relative positional embedding.
+        else:
+            position_embedding = position_bias
+            if position_embedding is None:
+                if not self.has_relative_attention_bias:
+                    position_embedding = torch.zeros(
+                        (2, 1, 1, real_seq_length, key_length, self.key_value_proj_dim), 
+                        device=scores.device, dtype=scores.dtype)
+                else:
+                    position_embedding = self.compute_invariant_embeddings_with_additional_positional_info(
+                        real_seq_length, key_length, type_ids, row_ids, col_ids)
+
+                if past_key_value is not None:
+                    positional_embedding = position_embedding[:, :, :, -seq_length:, :, :]
+
+            # shape (batch_size, 1, query_length, key_length, kv_dim)
+            relative_position_key_embedding = position_embedding[0]
+            relative_position_val_embedding = position_embedding[1]
+
+            score = torch.matmul(query_states, 
+                key_states.transpose(3, 2))
+
+            results = []
+            # shape (batch_size, 1, query_length, kv_dim, key_length)
+            relative_position_key_embedding = relative_position_key_embedding.transpose(4,3)
+            for i in range(relative_position_key_embedding.shape[2]):
+                results.append(
+                    # shape (batch, n_heads, key_length)
+                    torch.matmul(
+                        # shape (batch, n_heads, kv_dim)
+                        query_states[:,:,i,:],
+                        # shape (batch_size, 1, kv_dim, key_length)
+                        relative_position_key_embedding[:,:,i,:,:]
+                        )
+                    )
+
+            relative_position_bias = torch.cat(results, dim=2)
+
+            score += relative_position_bias
+
+            if mask is not None:
+                score += mask
+
+            attn_weights = F.softmax(scores.float(), dim=-1).type_as(
+                scores
+            )  # (batch_size, n_heads, seq_length, key_length)
+            attn_weights = F.dropout(
+                attn_weights, p=self.dropout, training=self.training
+            )  # (batch_size, n_heads, seq_length, key_length)
+
+            # Mask heads if we want to
+            if layer_head_mask is not None:
+                attn_weights = attn_weights * layer_head_mask
+
+            # (batch_size, seq_length, dim)
+            attn_output = unshape(torch.matmul(attn_weights, value_states))  
+            attn_output = self.o(attn_output)
+
+            present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
+            outputs = (attn_output,) + (present_key_value_state,) + (position_embedding,)
+
+            if output_attentions:
+                outputs = outputs + (attn_weights,)
+
+            return outputs
 
 
 class T5LayerSelfAttention(nn.Module):
     def __init__(self, config, has_relative_attention_bias=False):
         super().__init__()
         self.SelfAttention = T5Attention(config, has_relative_attention_bias=has_relative_attention_bias)
+        # self.SelfAttention = T5AttentionFullRelativePositionEmbedding(
+        #     config, has_relative_attention_bias=has_relative_attention_bias)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -607,6 +922,8 @@ class T5LayerCrossAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.EncDecAttention = T5Attention(config, has_relative_attention_bias=False)
+        # self.EncDecAttention = T5AttentionFullRelativePositionEmbedding(
+        #     config, has_relative_attention_bias=False)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 

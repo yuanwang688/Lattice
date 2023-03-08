@@ -6,7 +6,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
 --train_file totto_data/train.csv \
 --validation_file totto_data/dev.csv \
 --test_file totto_data/dev.csv \
---output_dir outputs/base \
+--output_dir outputs/additional_info_full_embedding \
 --per_device_train_batch_size 8 \
 --gradient_accumulation_steps 1 \
 --per_device_eval_batch_size 32 \
@@ -26,4 +26,5 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
 --load_best_model_at_end \
 --dataloader_num_workers 8 \
 --overwrite_cache \
---predict_with_generate
+--overwrite_output_dir \
+--predict_with_generate \
